@@ -1,6 +1,6 @@
 (ns ^{:doc "Some functions to help test the algorithms using a monte carlo simulation."
       :author "Paul Ingles"}
-  bandit.simulate
+    bandit.simulate
   (:use [clojure.data.csv :only (write-csv)]
         [clojure.java.io :only (writer)]
         [clojure.string :only (join)]
@@ -11,7 +11,9 @@
   (:require [bandit.algo.exp3 :as exp3]
             [bandit.algo.bayes :as bayes]
             [bandit.algo.ucb :as ucb]
-            [bandit.algo.softmax :as softmax])
+            [bandit.algo.softmax :as softmax]
+            [bandit.test-cases :as test-cases]
+            [quil.core :as q])
   (:gen-class))
 
 (defn bernoulli-arm
@@ -62,7 +64,7 @@
 
    example: to run the algorithm against the bandit to horizon 20:
 
-   (take 20 (simulation-seq bandit (partial eps/select-arm epsilon) arms))"
+   (take 20 (simulation-seq bandit bayes/select-arm bayes/reward arms))"
   [bandit selectfn rewardfn arms]
   (rest (iterate (partial simulate bandit selectfn rewardfn)
                  {:arms arms
@@ -73,7 +75,8 @@
   "Results is the set of results at time t across all simulations."
   [results]
   (let [t (:t (first results))]
-    [t (float (mean (map :cumulative-reward results)))]))
+    ["bayes" "bayes" "0.3" 1 t (:pulled (first results)) (:reward (first results))
+     (float (mean (map :cumulative-reward results)))]))
 
 (defn transpose
   [coll]
@@ -84,39 +87,172 @@
   [& args]
   (let [[options args banner] (cli args
                                    ["-a" "--algorithm" "Algorithm to use." :default "bayes"]
-                                   ["-e" "--epsilon" "Value to control algorithm's tendency to explore." :default 0.3]
+                                   ["-e" "--epsilon" "Value to control algorithm's tendency to explore." :default 1.0]
                                    ["-o" "--output" "File path to write results to" :default "results.csv"]
-                                   ["-n" "--num-simulations" "Number of simulations to execute" :default 10]
-                                   ["-t" "--time" "Time: number of iterations within simulation" :default 1000]
+                                   ["-n" "--num-simulations" "Number of simulations to execute" :default 1]
+                                   ["-t" "--time" "Time: number of iterations within simulation" :default 27332]
                                    ["-h" "--help" "Display this"])]
     (when (:help options)
       (println banner)
       (System/exit 0))
-    (let [{:keys [output num-simulations time algorithm epsilon]} options
-          n-sims      (Integer/valueOf num-simulations)
-          horizon     (Integer/valueOf time)
-          bandit      (mk-bernoulli-bandit :arm1 0.1 :arm2 0.1 :arm3 0.1 :arm4 0.1 :arm5 0.9)
-          epsilon     (Double/valueOf epsilon)
-          gamma       epsilon
-          arms        (exp3/bandit :arm1 :arm2 :arm3 :arm4 :arm5)
-          algos       {:bayes   {:select bayes/select-arm
-                                 :reward bayes/reward}
-                       :exp3    {:select (partial exp3/select-arm gamma)
-                                 :reward (partial exp3/reward gamma 5)}
-                       :ucb     {:select ucb/select-arm
-                                 :reward reward}
-                       :softmax {:select (partial softmax/select-arm epsilon)
-                                 :reward reward}}
-          algo        (keyword algorithm)]
-      (println "Starting simulations ...")
-      (with-open [out-csv (writer output)]
-        (write-csv out-csv
-                   (->> (repeatedly n-sims (fn []
-                                             (map :result (simulation-seq bandit
-                                                                          (-> algos algo :select)
-                                                                          (-> algos algo :reward)
-                                                                          arms))))
-                        (transpose)
-                        (map summary-row)
-                        (take horizon))))
-      (println "Completed simulations. Results in" output))))
+    (time
+     (let [{:keys [output num-simulations time algorithm epsilon]} options
+           algo        {:select bayes/select-arm
+                        :reward bayes/reward}]
+       (println "Starting simulations ...")
+       (with-open [out-csv (writer "output.csv")]
+         (write-csv out-csv
+                    (doall
+                     (for [[control-samples variant-samples control-conversions variant-conversions]
+                           test-cases/realistic-case]
+                       (let [control-conversion (/ (double control-conversions) (double control-samples))
+                             variant-conversion (/ (double variant-conversions) (double variant-samples))
+                             number-of-samples  (+ control-samples variant-samples)
+                             bandit      (mk-bernoulli-bandit :control control-conversion :variant variant-conversion)
+                             arms        (exp3/bandit :control :variant)]
+                         (println "Running test with " control-samples " control samples and " variant-samples " variant samples")
+                         (into [control-samples variant-samples control-conversions variant-conversions (+ control-conversions variant-conversions) control-conversion variant-conversion]
+                               (doall (for [i (range 10)]
+                                        (->> (simulation-seq bandit
+                                                             bayes/select-arm
+                                                             bayes/reward
+                                                             arms)
+                                             (take number-of-samples)
+                                             (map :result)
+                                             (sort-by :t)
+                                             last
+                                             :cumulative-reward)))))))))
+       (println "Completed simulations. Results in" output)))))
+
+
+
+(defn simulate-chained-bandit
+  "runs a simulation. bandit is a sequence of arms (functions) that
+   return their numerical reward value.
+   bandit: the multi-armed machine we're optimising against
+   selectfn: the algorithm function to select the arm. (f arms)
+   arms: current algorithm state"
+  [{:keys [arms result bandit]}]
+  (let [[home-page-arms results-page-arms] arms
+        [home-page-bandit results-page-bandit] bandit
+        first-pull   (bayes/select-arm (vals home-page-arms))
+        second-pull  (bayes/select-arm (vals results-page-arms))
+        first-label  (:name first-pull)
+        second-label (:name second-pull)
+        rwd (* (draw-arm (get home-page-bandit first-label))
+               (draw-arm (get results-page-bandit second-label)))
+        {:keys [cumulative-reward t]} result]
+    {:arms [(update (-> first-pull (bayes/reward rwd) (pulled)) home-page-arms)
+            (update (-> second-pull (bayes/reward rwd) (pulled)) results-page-arms)]
+     :bandit bandit
+     :result {:pulled [first-pull second-pull]
+              :reward rwd
+              :t (inc t)
+              :cumulative-reward (+ cumulative-reward rwd)}}))
+
+;; (defn simulate
+;;   "runs a simulation. bandit is a sequence of arms (functions) that
+;;    return their numerical reward value.
+;;    bandit: the multi-armed machine we're optimising against
+;;    selectfn: the algorithm function to select the arm. (f arms)
+;;    arms: current algorithm state"
+;;   [bandit selectfn rewardfn {:keys [arms result]}]
+;;   (let [gamma 0.1
+;;         pull (selectfn (vals arms))
+;;         selected-label (:name pull)
+;;         arm (get bandit selected-label)
+;;         rwd (draw-arm arm)
+;;         {:keys [cumulative-reward t]} result]
+;;     {:arms (update (-> pull (rewardfn rwd) (pulled)) arms)
+;;      :result {:pulled selected-label
+;;               :reward rwd
+;;               :t (inc t)
+;;               :cumulative-reward (+ cumulative-reward rwd)}}))
+
+
+(def initial-state
+  {:bandit [{:home-page-variant-a (bernoulli-arm 0.1)
+             :home-page-variant-b (bernoulli-arm 0.3)}
+            {:results-page-variant-a (bernoulli-arm 0.9)
+             :results-page-variant-b (bernoulli-arm 0.2)}]
+   :arms   [(exp3/bandit :home-page-variant-a
+                         :home-page-variant-b)
+            (exp3/bandit :results-page-variant-a
+                         :results-page-variant-b)]
+   :result {:pulled nil
+            :reward 0
+            :t 0
+            :cumulative-reward 0}})
+
+(defn run-chained-simulation
+  []
+  (iterate simulate-chained-bandit initial-state))
+
+(def arm-paths
+  [[0 :home-page-variant-a]
+   [0 :home-page-variant-b]
+   [1 :results-page-variant-a]
+   [1 :results-page-variant-b]])
+
+(defn prepare-data
+  []
+  (->> (run-chained-simulation)
+       (map (fn [{:keys [arms result]}]
+              (reduce concat
+                      (into [((juxt :t (comp :name :pulled) :reward :cumulative-reward) result)]
+                            (for [path arm-paths]
+                              (let [arm (get-in arms path)]
+                                [(:name arm) (:pulls arm) (:value arm) (:weight arm)]))))))
+       (take 100000)))
+
+(defn calculate-conversions-under-chained-methodology
+  [number-of-samples]
+  (doall (for [i (range 100)]
+           (->> (run-chained-simulation)
+                (take number-of-samples)
+                (map :result)
+                (sort-by :t)
+                last
+                :cumulative-reward))))
+
+(defn write-to-csv
+  [data]
+  (with-open [out-csv (writer "/tmp/output.csv")]
+    (write-csv out-csv data)))
+
+(def current-state
+  (atom initial-state))
+
+(defn update-state!
+  []
+  (println "-------------------------------------------")
+  (println @current-state)
+  (swap! current-state simulate-chained-bandit))
+
+(def initial-position
+  {:home-page-variant-a [20 20]
+   :home-page-variant-b [20 100]
+   :results-page-variant-a [100 20]
+   :results-page-variant-b [100 100]})
+
+(defn draw
+  []
+  (update-state!)
+  (doseq [arm-path arm-paths]
+    (let [arm (get-in (:arms @current-state) arm-path)
+          [x y] (initial-position (:name arm))]
+      (println (:pulls arm))
+      (q/ellipse x y (+ 5 (:pulls arm)) (+ 5 (:pulls arm))))))
+
+(defn setup
+  []
+  (q/frame-rate 5))
+
+(defn draw-it
+  []
+  (q/defsketch bandit-sketch                  
+    :title    "Chained Bandit"    
+    :settings #(q/smooth 2)             
+    :draw     draw
+    :setup    setup
+    :size     [323 200]))
